@@ -23,24 +23,14 @@
 
 ## 🚀 快速开始
 
-### 1. 依赖安装
+### 依赖安装
 
 ```bash
-pip install pdf2image pdfplumber
+# 安装Python依赖
+pip install -r requirements.txt
+
 # MacOS还需要安装poppler用于PDF转图片
 brew install poppler
-```
-
-### 2. 基本使用
-
-```python
-from multimodal_pdf_extractor import extract_pdf_with_multimodal
-
-# 最简单调用，输出与原PDF同名的txt文件
-extract_pdf_with_multimodal("扫描版文件.pdf")
-
-# 指定输出路径
-extract_pdf_with_multimodal("扫描版文件.pdf", "输出文本.txt")
 ```
 
 ## 🛠️ 在Claude Code中安装使用
