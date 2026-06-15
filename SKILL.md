@@ -10,9 +10,13 @@ description: 多模态PDF内容提取工具，专门处理扫描版/图片型PDF
 ✅ **保留原始结构**：自动识别并保留段落、表格、列表、标题层级等原始文档结构
 ✅ **自动处理混合PDF**：自动判断PDF类型，普通可编辑PDF优先用文本提取，扫描/图片页自动用多模态识别
 ✅ **自动清理格式**：输出纯净文本，无乱码、无多余控制字符
+✅ **高效批量处理**：支持每5页为一批次调用多模态大模型，平衡识别效率和上下文长度，避免单次请求过长
 
 ## 使用前提
-当前模型必须具备多模态（图片理解）能力，如果不支持则回退到传统OCR方法。
+1. 若PDF全部为可编辑页，无需考虑模型是否具备多模态能力，直接提取文本即可。
+2. **强制扫描页处理规则**：只要PDF包含扫描页/图片页，对应页面必须调用多模态大模型识别，严禁使用传统OCR或其他非多模态方式处理，确保识别准确率。
+3. 若模型不具备多模态能力，扫描页在输出TXT中直接留白并标注：`=== 第X页（无法识别） === 当前模型不支持多模态能力，无法识别扫描页内容`。
+4. **输出顺序要求**：所有页面内容必须严格按照PDF原始页码顺序输出，禁止将扫描页统一放在文档末尾。
 
 ## 使用步骤
 
@@ -75,54 +79,92 @@ def extract_pdf_with_multimodal(pdf_path, output_txt_path=None):
         with pdfplumber.open(pdf_path) as pdf:
             total_pages = len(pdf.pages)
             full_content = ""
-            scan_pages = []  # 需要多模态识别的页码
+            pending_scans = []  # 待识别的扫描页队列：存储(页码, 图片base64)
+            all_images = None  # 懒加载PDF图片，只有遇到扫描页时才转换
+            BATCH_SIZE = 5  # 强制统一5页为一个批次，仅针对不可编辑的扫描页
             
-            print(f"📄 开始处理PDF，共{total_pages}页，逐页检测类型...")
+            print(f"📄 开始处理PDF，共{total_pages}页，逐页按顺序处理...")
             
-            # 第一轮：先处理所有可编辑页，记录需要多模态的页面
-            for page_num in range(total_pages):
-                page = pdf.pages[page_num]
+            # 逐页遍历，严格按页码顺序处理
+            for page_idx in range(total_pages):
+                page_num = page_idx + 1  # 页码从1开始
+                page = pdf.pages[page_idx]
                 page_text = page.extract_text()
                 
                 if page_text and len(page_text.strip()) > 50:  # 超过50字认为是可编辑页
-                    # 清理乱码后加入结果
-                    cleaned_text = clean_text_content(page_text)
-                    full_content += f"=== 第 {page_num+1} 页（可编辑） ===\n{cleaned_text}\n\n"
-                    print(f"  ✅ 第{page_num+1}页：可编辑，已提取")
-                else:
-                    # 记录为扫描页，后面统一处理
-                    scan_pages.append(page_num + 1)  # 页码从1开始
-                    print(f"  🖼️  第{page_num+1}页：扫描/图片页，等待识别")
-            
-            # 第二步：处理扫描页，如果有扫描页且模型支持多模态
-            if scan_pages:
-                if not has_multimodal:
-                    print("\n❌ 当前模型不支持多模态能力，无法识别以下扫描页：" + ",".join(map(str, scan_pages)))
-                    print("请使用支持多模态的模型，或使用传统OCR工具处理这些页面。")
-                else:
-                    print(f"\n🔍 开始识别{len(scan_pages)}个扫描页，调用多模态能力...")
-                    # 转换所有PDF页为图片（只需要处理扫描页）
-                    all_images = convert_from_path(pdf_path)
+                    # 先处理待识别队列中已有的扫描页（保证顺序）
+                    if pending_scans and has_multimodal:
+                        print(f"\n📦 处理批次扫描页，共{len(pending_scans)}页")
+                        for p_num, img_base64 in pending_scans:
+                            print(f"  识别第 {p_num}/{total_pages} 页...")
+                            page_content = model.image_understand(
+                                image=img_base64,
+                                prompt="请详细提取这张图片中的所有文字内容，包括标题、段落、表格、公式、代码块。表格请用 markdown 格式输出，保留原有结构。如果有公式请用LaTeX格式表示，代码块保留缩进和格式。不要遗漏任何内容，也不要添加额外说明。"
+                            )
+                            cleaned_content = clean_text_content(page_content)
+                            full_content += f"=== 第 {p_num} 页（扫描识别） ===\n{cleaned_content}\n\n"
+                        pending_scans = []
                     
-                    for page_num in scan_pages:
-                        page_image = all_images[page_num - 1]  # 转成0索引
+                    # 处理当前可编辑页
+                    cleaned_text = clean_text_content(page_text)
+                    full_content += f"=== 第 {page_num} 页（可编辑） ===\n{cleaned_text}\n\n"
+                    print(f"  ✅ 第{page_num}页：可编辑，已提取")
+                    
+                else:
+                    # 扫描/图片页处理
+                    print(f"  🖼️  第{page_num}页：扫描/图片页")
+                    
+                    if not has_multimodal:
+                        # 模型不支持多模态，直接标注无法识别
+                        full_content += f"=== 第 {page_num} 页（无法识别） === 当前模型不支持多模态能力，无法识别扫描页内容\n\n"
+                        print(f"  ❌ 第{page_num}页：模型不支持多模态，已标注无法识别")
+                    else:
+                        # 懒加载PDF所有页面为图片
+                        if all_images is None:
+                            print(f"  🔄 加载PDF页面图片...")
+                            all_images = convert_from_path(pdf_path)
+                        
+                        # 转换为base64加入待识别队列
+                        page_image = all_images[page_idx]
                         img_base64 = pdf_page_to_base64(page_image)
+                        pending_scans.append((page_num, img_base64))
                         
-                        print(f"  识别第 {page_num}/{total_pages} 页...")
-                        # 调用多模态能力识别图片内容
-                        page_content = model.image_understand(
-                            image=img_base64,
-                            prompt="请详细提取这张图片中的所有文字内容，包括标题、段落、表格、公式、代码块。表格请用 markdown 格式输出，保留原有结构。如果有公式请用LaTeX格式表示，代码块保留缩进和格式。不要遗漏任何内容，也不要添加额外说明。"
-                        )
-                        
-                        cleaned_content = clean_text_content(page_content)
-                        full_content += f"=== 第 {page_num} 页（扫描识别） ===\n{cleaned_content}\n\n"
+                        # 队列满5页时批量识别
+                        if len(pending_scans) >= BATCH_SIZE:
+                            print(f"\n📦 处理批次扫描页，共{len(pending_scans)}页")
+                            for p_num, img_base64 in pending_scans:
+                                print(f"  识别第 {p_num}/{total_pages} 页...")
+                                page_content = model.image_understand(
+                                    image=img_base64,
+                                    prompt="请详细提取这张图片中的所有文字内容，包括标题、段落、表格、公式、代码块。表格请用 markdown 格式输出，保留原有结构。如果有公式请用LaTeX格式表示，代码块保留缩进和格式。不要遗漏任何内容，也不要添加额外说明。"
+                                )
+                                cleaned_content = clean_text_content(page_content)
+                                full_content += f"=== 第 {p_num} 页（扫描识别） ===\n{cleaned_content}\n\n"
+                            pending_scans = []
+            
+            # 处理最后剩余的不足5页的扫描页
+            if pending_scans and has_multimodal:
+                print(f"\n📦 处理最后批次扫描页，共{len(pending_scans)}页")
+                for p_num, img_base64 in pending_scans:
+                    print(f"  识别第 {p_num}/{total_pages} 页...")
+                    page_content = model.image_understand(
+                        image=img_base64,
+                        prompt="请详细提取这张图片中的所有文字内容，包括标题、段落、表格、公式、代码块。表格请用 markdown 格式输出，保留原有结构。如果有公式请用LaTeX格式表示，代码块保留缩进和格式。不要遗漏任何内容，也不要添加额外说明。"
+                    )
+                    cleaned_content = clean_text_content(page_content)
+                    full_content += f"=== 第 {p_num} 页（扫描识别） ===\n{cleaned_content}\n\n"
+            
+            # 统计结果
+            editable_count = total_pages - len([p for p in full_content.split("=== 第 ") if "（扫描识别）" in p or "（无法识别）" in p])
+            scan_count = len([p for p in full_content.split("=== 第 ") if "（扫描识别）" in p])
+            unrecognized_count = len([p for p in full_content.split("=== 第 ") if "（无法识别）" in p])
             
             # 保存最终结果
             with open(output_txt_path, "w", encoding="utf-8") as f:
                 f.write(full_content)
             
-            print(f"\n🎉 PDF提取完成！可编辑页：{total_pages - len(scan_pages)}页，扫描识别页：{len(scan_pages)}页")
+            print(f"\n🎉 PDF提取完成！")
+            print(f"📊 统计：可编辑页：{editable_count}页，扫描识别页：{scan_count}页，无法识别页：{unrecognized_count}页")
             print(f"✅ 结果已保存到：{output_txt_path}")
             return full_content
             
@@ -145,3 +187,4 @@ extract_pdf_with_multimodal("扫描版文件.pdf", "输出文本.txt")
 2. **低质量PDF优化**：对于特别模糊的扫描件，可以提示模型"这是低清晰度扫描件，请尽量识别所有可辨认的文字，不确定的地方用[?]标注"
 3. **表格提取优化**：如果重点是表格，可以在识别prompt里特别强调"请重点关注表格内容，准确还原行列结构，用markdown表格格式输出"
 4. **中英文混合**：默认支持中英文混合识别，不需要额外配置
+5. **强制批次规则**：不可编辑的扫描页统一按5页为一个批次调用多模态大模型，不允许调整批次大小，确保识别稳定性和效率平衡
